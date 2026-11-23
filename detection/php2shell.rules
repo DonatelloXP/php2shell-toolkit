@@ -1,0 +1,439 @@
+# ============================================================================
+# php2shell — Suricata / Snort IDS Rules
+# CVE-2026-109618 / CVE-2026-109619
+#
+# These rules detect exploitation attempts and reconnaissance for the
+# php2shell vulnerabilities in PHP's session.upload_progress handler
+# and OOM corruption path.
+#
+# SID range: 2026100 - 2026119
+# Author: Qi Deng (@ikow)
+# Reference: https://github.com/ikow/php2shell-poc
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# REQUEST-SIDE DETECTION
+# --------------------------------------------------------------------------
+
+# SID 2026100 — PHP_SESSION_UPLOAD_PROGRESS in multipart POST body
+# The primary trigger for CVE-2026-109619 session-based exploitation.
+# This PHP feature has near-zero legitimate use in modern applications.
+# Severity: HIGH — direct exploitation indicator
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL PHP_SESSION_UPLOAD_PROGRESS in multipart POST"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; \
+    classtype:web-application-attack; \
+    sid:2026100; rev:1; \
+    metadata:cve CVE-2026-109618, cve CVE-2026-109619, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+    reference:cve,2026-109619; \
+    reference:url,github.com/ikow/php2shell-poc; \
+)
+
+# SID 2026101 — PHPSESSID as multipart form field (session fixation)
+# Normal browsers send PHPSESSID as a Cookie header, never as a POST field.
+# Session fixation via POST body bypasses use_only_cookies.
+# Severity: HIGH — session fixation primitive
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL PHPSESSID in multipart POST body (session fixation)"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.request_body; content:"name=|22|PHPSESSID|22|"; \
+    classtype:web-application-attack; \
+    sid:2026101; rev:1; \
+    metadata:cve CVE-2026-109618, cve CVE-2026-109619, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+)
+
+# SID 2026102 — PHP code in multipart upload filename
+# Session injection attack: PHP code stored in session file via filename.
+# Combined with any LFI, this gives pre-auth RCE.
+# Severity: CRITICAL — direct code injection
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL PHP code in upload filename (session injection)"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.request_body; content:"filename=|22|"; content:"<?"; distance:0; within:500; \
+    classtype:web-application-attack; \
+    sid:2026102; rev:1; \
+    metadata:cve CVE-2026-109618, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+)
+
+# SID 2026103 — Serialized PHP object in multipart filename (handler mismatch)
+# Pipe character followed by O: (object serialization) in filename triggers
+# deserialization via session handler mismatch. __destruct fires even on
+# decode failure.
+# Severity: CRITICAL — deserialization attack
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL serialized object in upload filename (handler mismatch)"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.request_body; content:"filename=|22|"; content:"|7c|O:|22|"; distance:0; within:200; \
+    classtype:web-application-attack; \
+    sid:2026103; rev:1; \
+    metadata:cve CVE-2026-109619, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109619; \
+)
+
+# SID 2026104 — Abnormally long filename in multipart upload
+# Session inflation attack: 10KB+ filenames stored in session file to build
+# a huge session that triggers OOM on decode.
+# Severity: MEDIUM — reconnaissance / setup phase
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL oversized filename in multipart upload (session inflation)"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; \
+    http.request_body; content:"filename=|22|"; \
+    isdataat:10000,relative; \
+    classtype:web-application-attack; \
+    sid:2026104; rev:1; \
+    metadata:cve CVE-2026-109619, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109619; \
+)
+
+# SID 2026105 — Multipart POST without Content-Length to PHP
+# OOM bypass technique: missing Content-Length skips PHP's post_max_size
+# check, allowing unlimited body data to be parsed.
+# Severity: MEDIUM — OOM attack enabler
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL chunked multipart POST (post_max_size bypass)"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.header; content:"Transfer-Encoding"; content:"chunked"; \
+    classtype:web-application-attack; \
+    sid:2026105; rev:1; \
+    metadata:cve CVE-2026-109618, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+)
+
+# SID 2026106 — Session file path in URL parameters (LFI trigger)
+# Attacker includes the poisoned session file via LFI after injection.
+# Severity: HIGH — LFI exploitation
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL session file path in URL (LFI exploitation)"; \
+    flow:established,to_server; \
+    http.uri; content:"/sess_"; \
+    http.uri; pcre:"/(?:\/tmp\/sessions|\/var\/lib\/php\/sessions?)\/sess_/i"; \
+    classtype:web-application-attack; \
+    sid:2026106; rev:1; \
+    metadata:cve CVE-2026-109618, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+)
+
+# --------------------------------------------------------------------------
+# RESPONSE-SIDE DETECTION
+# --------------------------------------------------------------------------
+
+# SID 2026110 — PHP OOM error in HTTP response
+# Indicates successful OOM trigger — either active probing or exploitation.
+# Severity: HIGH — exploitation indicator
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL PHP OOM error in response (exploitation indicator)"; \
+    flow:established,to_client; \
+    http.response_body; content:"Allowed memory size"; \
+    content:"exhausted"; distance:0; within:100; \
+    classtype:web-application-attack; \
+    sid:2026110; rev:1; \
+    metadata:cve CVE-2026-109618, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+)
+
+# SID 2026111 — Session destruction failure in response
+# Direct evidence that stale BG(unserialize) state was consumed during
+# the rfc1867 upload progress handler (CVE-2026-109619 exploitation).
+# Severity: CRITICAL — active exploitation confirmed
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL session destruction failure (stale state exploitation)"; \
+    flow:established,to_client; \
+    http.response_body; content:"Session object destruction failed"; \
+    classtype:web-application-attack; \
+    sid:2026111; rev:1; \
+    metadata:cve CVE-2026-109619, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109619; \
+)
+
+# SID 2026112 — Anomalous PHPSESSID in response cookie (memory leak)
+# CVE-2026-109618 can leak freed heap memory via the Set-Cookie PHPSESSID
+# value. Normal session IDs are 26-32 hex characters.
+# (Discovered by Sansec)
+# Severity: CRITICAL — post-exploitation data leak
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL anomalous PHPSESSID in response (heap memory leak)"; \
+    flow:established,to_client; \
+    http.header; content:"Set-Cookie"; content:"PHPSESSID="; \
+    pcre:"/Set-Cookie:\s*PHPSESSID=[a-zA-Z0-9,-]{64,}/"; \
+    classtype:web-application-attack; \
+    sid:2026112; rev:1; \
+    metadata:cve CVE-2026-109618, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+    reference:url,sansec.io/research/php2shell; \
+)
+
+# --------------------------------------------------------------------------
+# RECONNAISSANCE DETECTING
+# --------------------------------------------------------------------------
+
+# SID 2026115 — Small multipart POST with upload progress (probing)
+# Attacker sends a tiny multipart POST with PHP_SESSION_UPLOAD_PROGRESS
+# to check if the feature is enabled before launching the full exploit.
+# Threshold: 3 hits from same source in 60 seconds.
+# Severity: LOW — reconnaissance
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL reconnaissance probe (small upload progress request)"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"multipart/form-data"; \
+    http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; \
+    dsize:<2000; \
+    threshold:type both, track by_src, count 3, seconds 60; \
+    classtype:web-application-activity; \
+    sid:2026115; rev:1; \
+    metadata:cve CVE-2026-109618, cve CVE-2026-109619, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+    reference:cve,2026-109619; \
+)
+
+# SID 2026116 — Vulnerable PHP version in response header
+# Detects PHP versions known to be vulnerable (< 8.2.35, < 8.3.36,
+# < 8.4.27, < 8.5.12). Only alerts once per source per hour.
+# Severity: INFO — asset inventory
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"PHP2SHELL vulnerable PHP version exposed in response header"; \
+    flow:established,to_client; \
+    http.header; content:"X-Powered-By"; content:"PHP/"; \
+    pcre:"/X-Powered-By:\s*PHP\/(?:5\.|7\.|8\.[01]\.|8\.2\.(?:[0-9]|[12][0-9]|3[0-4])\b|8\.3\.(?:[0-9]|[12][0-9]|3[0-5])\b|8\.4\.(?:[0-9]|1[0-9]|2[0-6])\b|8\.5\.(?:[0-9]|1[01])\b)/"; \
+    threshold:type limit, track by_src, count 1, seconds 3600; \
+    classtype:policy-violation; \
+    sid:2026116; rev:1; \
+    metadata:cve CVE-2026-109618, cve CVE-2026-109619, \
+             created_at 2026_10_21, updated_at 2026_10_21; \
+    reference:cve,2026-109618; \
+)
+# ═══════════════════════════════════════════════════════════════════════
+# NEW CHAIN DETECTION RULES (F, G, H)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Chain F: Session Key Smuggling — detect '|' in PHP_SESSION_UPLOAD_PROGRESS
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Chain F: Session Key Smuggling — pipe in upload_progress"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; \
+    content:"|7C|"; distance:0; within:50; \
+    classtype:web-application-attack; \
+    sid:2026109701; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# Chain F: Session Key Smuggling — detect serialized object in upload_progress
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Chain F: POP gadget in upload_progress key"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; \
+    content:"O:"; distance:0; within:100; \
+    content:":"; distance:0; within:20; \
+    classtype:web-application-attack; \
+    sid:2026109702; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# Chain G: OPcache Poisoning — detect file_put_contents to PHP file
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Chain G: OPcache poisoning — write to PHP file"; \
+    flow:established,to_server; \
+    http.request_body; content:"file_put_contents"; \
+    content:".php"; distance:0; within:200; \
+    classtype:web-application-attack; \
+    sid:2026109703; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# Chain G: OPcache Poisoning — detect immediate file restore pattern
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Chain G: OPcache write+cache+restore pattern"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.request_body; content:"___START___"; \
+    content:"file_put_contents"; distance:0; within:500; \
+    classtype:web-application-attack; \
+    sid:2026109704; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# Chain H: ZMM Grooming — detect multiple small multipart allocations
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Chain H: ZMM grooming — many small form fields"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.request_body; content:"name=|22|g0|22|"; \
+    content:"name=|22|g1|22|"; distance:0; within:500; \
+    content:"name=|22|g2|22|"; distance:0; within:500; \
+    classtype:web-application-attack; \
+    sid:2026109705; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# Chain H: ZMM Grooming — detect trigger code after spray
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Chain H: ZMM trigger after grooming spray"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.request_body; content:"ZMM_TRIGGER_OK"; \
+    classtype:web-application-attack; \
+    sid:2026109706; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# PHAR Bomb: detect phar:// in LFI parameter
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell PHAR Bomb: phar:// stream wrapper in parameter"; \
+    flow:established,to_server; \
+    http.uri; content:"phar"; nocase; \
+    content:"://"; distance:0; within:5; \
+    classtype:web-application-attack; \
+    sid:2026109707; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# LFI Escalation: detect php://filter chain
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell LFI Escalation: php://filter chain (iconv oracle)"; \
+    flow:established,to_server; \
+    http.uri; content:"php"; nocase; \
+    content:"://filter/convert.iconv"; nocase; distance:0; within:20; \
+    classtype:web-application-attack; \
+    sid:2026109708; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# LFI Escalation: detect data:// wrapper
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell LFI Escalation: data:// wrapper (direct exec)"; \
+    flow:established,to_server; \
+    http.uri; content:"data"; nocase; \
+    content:"://text/plain;base64,"; distance:0; within:20; \
+    classtype:web-application-attack; \
+    sid:2026109709; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# Session Fixation: detect custom PHPSESSID injection
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Session Fixation: custom SID injection attempt"; \
+    flow:established,to_server; \
+    http.cookie; content:"PHPSESSID=fixtest"; nocase; \
+    classtype:web-application-attack; \
+    sid:2026109710; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# Hybrid D+A: detect sub-crash OOM + immediate LFI pattern
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"php2shell Hybrid D+A: sub-crash OOM followed by LFI"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.request_body; content:"X-Pad-0"; \
+    content:"PHP_SESSION_UPLOAD_PROGRESS"; distance:0; within:2000; \
+    classtype:web-application-attack; \
+    sid:2026109711; rev:1; \
+    metadata:created_at 2026_01_01, target php; \
+)
+
+# ============================================================================
+# GHOST DOOR — Persistence Detection (php2shell post-exploit)
+# SID range: 2026110 - 2026119
+# ============================================================================
+
+# SID 2026110 — .tpl_*.php in uploads/assets (template-cache poison)
+# Ghost door plants .tpl_<hash>.php files in cache/upload dirs to evade
+# file-integrity scanners that skip generated-looking files.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL GHOST DOOR: .tpl_*.php in upload/cache dir"; \
+    flow:established,to_server; \
+    http.uri; content:".tpl_"; nocase; \
+    pcre:"/\/(uploads|assets|cache|tmp|media|files|images)\/\.tpl_[0-9a-f]+\.php/i"; \
+    classtype:web-application-attack; \
+    sid:2026110; rev:1; \
+    metadata:created_at 2026_10_24, target ghost_door; \
+)
+
+# SID 2026111 — .user.ini with auto_prepend_file (prepend persistence)
+# .user.ini dropped in a PHP dir auto-prepends payload to every request.
+# Hidden dotfile — evades normal dir listings.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL GHOST DOOR: .user.ini auto_prepend_file upload"; \
+    flow:established,to_server; \
+    http.request_body; content:"auto_prepend_file"; nocase; \
+    classtype:web-application-attack; \
+    sid:2026111; rev:1; \
+    metadata:created_at 2026_10_24, target ghost_door; \
+)
+
+# SID 2026112 — Ghost loader eval param (?g= base64)
+# All ghost doors share the same loader: eval(base64_decode($_REQUEST['g']))
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL GHOST DOOR: ?g= eval request"; \
+    flow:established,to_server; \
+    http.uri; content:"?g="; \
+    pcre:"/\?g=[A-Za-z0-9+\/=]{20,}/"; \
+    classtype:web-application-attack; \
+    sid:2026112; rev:1; \
+    metadata:created_at 2026_10_24, target ghost_door; \
+)
+
+# SID 2026113 — GIF89a + <?php polyglot upload
+# Phar-polyglot files: valid GIF header + PHP payload appended.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL GHOST DOOR: GIF89a+PHP polyglot upload"; \
+    flow:established,to_server; \
+    http.request_body; content:"GIF89a"; \
+    content:"<?php"; distance:0; within:200; \
+    classtype:web-application-attack; \
+    sid:2026113; rev:1; \
+    metadata:created_at 2026_10_24, target ghost_door; \
+)
+
+# SID 2026114 — Resurrection file write (.g_*.dat in tmp/session dirs)
+# Loader files written to session.save_path / sys_get_temp_dir (outside webroot)
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL GHOST DOOR: resurrection file .g_*.dat write"; \
+    flow:established,to_server; \
+    http.request_body; content:".g_"; nocase; \
+    pcre:"/\.g_[0-9a-f]{6}\.dat/i"; \
+    classtype:web-application-attack; \
+    sid:2026114; rev:1; \
+    metadata:created_at 2026_10_24, target ghost_door; \
+)
+
+# SID 2026115 — Composer autoload injection
+# Appending to autoload_files.php executes on EVERY request.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"PHP2SHELL GHOST DOOR: composer autoload injection"; \
+    flow:established,to_server; \
+    http.uri; content:"autoload_files.php"; nocase; \
+    classtype:web-application-attack; \
+    sid:2026115; rev:1; \
+    metadata:created_at 2026_10_24, target ghost_door; \
+)
