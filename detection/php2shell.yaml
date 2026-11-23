@@ -1,0 +1,366 @@
+# ============================================================================
+# php2shell — Sigma Detection Rules
+# CVE-2026-109618 / CVE-2026-109619
+#
+# Log-based detection for web server logs and host-level events.
+# Compatible with Sigma-compatible SIEMs (Splunk, Elastic, Sentinel, etc.)
+#
+# Author: Qi Deng (@ikow)
+# Reference: https://github.com/ikow/php2shell-poc
+# ============================================================================
+
+---
+title: php2shell Exploitation Attempt via Upload Progress
+id: a1f2e3d4-5678-9abc-def0-php2shell001
+status: experimental
+description: >
+  Detects HTTP POST requests to PHP endpoints containing
+  PHP_SESSION_UPLOAD_PROGRESS in the request body. This is the primary
+  trigger for CVE-2026-109618 and CVE-2026-109619. Legitimate use of
+  this PHP feature is extremely rare in modern applications.
+author: Qi Deng (@ikow)
+date: 2026-10-21
+references:
+  - https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
+  - https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp
+  - https://github.com/ikow/php2shell-poc
+logsource:
+  category: webserver
+detection:
+  selection:
+    cs-method: POST
+    cs-uri|endswith: '.php'
+  keywords:
+    - 'PHP_SESSION_UPLOAD_PROGRESS'
+  condition: selection and keywords
+level: high
+falsepositives:
+  - Legacy PHP applications that still use server-side upload progress tracking
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - cve.2026.109618
+  - cve.2026.109619
+
+---
+title: php2shell OOM Exploitation via Oversized Multipart POST
+id: a1f2e3d4-5678-9abc-def0-php2shell002
+status: experimental
+description: >
+  Detects large multipart POST requests to PHP endpoints that result in
+  server errors. The OOM corruption path (CVE-2026-109618) sends hundreds
+  of form fields to exhaust PHP's memory_limit during multipart parsing.
+author: Qi Deng (@ikow)
+date: 2026-10-21
+references:
+  - https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
+  - https://github.com/ikow/php2shell-poc
+logsource:
+  category: webserver
+detection:
+  selection:
+    cs-method: POST
+    cs-uri|endswith: '.php'
+    sc-status:
+      - 500
+      - 502
+      - 503
+  filter_size:
+    cs-bytes|gte: 5000000
+  condition: selection and filter_size
+level: medium
+falsepositives:
+  - Large legitimate file uploads that fail for other reasons
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - cve.2026.109618
+
+---
+title: php2shell Post-Exploitation — Shell Spawned by PHP Process
+id: a1f2e3d4-5678-9abc-def0-php2shell003
+status: experimental
+description: >
+  Detects a shell or scripting interpreter spawned as a child of a PHP
+  process (php-fpm, php-cgi, apache2, httpd). This indicates successful
+  code execution following php2shell exploitation.
+author: Qi Deng (@ikow)
+date: 2026-10-21
+references:
+  - https://github.com/ikow/php2shell-poc
+logsource:
+  product: linux
+  category: process_creation
+detection:
+  selection_parent:
+    ParentImage|endswith:
+      - '/php-fpm'
+      - '/php-cgi'
+      - '/php'
+      - '/apache2'
+      - '/httpd'
+  selection_child:
+    Image|endswith:
+      - '/sh'
+      - '/bash'
+      - '/dash'
+      - '/python'
+      - '/python3'
+      - '/perl'
+      - '/ruby'
+      - '/nc'
+      - '/ncat'
+      - '/curl'
+      - '/wget'
+  condition: selection_parent and selection_child
+level: critical
+falsepositives:
+  - PHP applications that legitimately exec shell commands (cron jobs, image processing)
+tags:
+  - attack.execution
+  - attack.t1059
+  - cve.2026.109618
+  - cve.2026.109619
+
+---
+title: php2shell Session File Poisoning
+id: a1f2e3d4-5678-9abc-def0-php2shell004
+status: experimental
+description: >
+  Detects PHP code written into session files on disk. The session injection
+  attack stores PHP code in the session file via the upload filename, then
+  includes it via LFI for code execution.
+author: Qi Deng (@ikow)
+date: 2026-10-21
+references:
+  - https://github.com/ikow/php2shell-poc
+logsource:
+  product: linux
+  category: file_event
+detection:
+  selection_path:
+    TargetFilename|contains:
+      - '/sessions/sess_'
+      - '/php/sessions/sess_'
+  selection_content:
+    TargetFilename|endswith: '.php'  # false trigger guard
+  keywords_in_file:
+    - '<?php'
+    - 'system('
+    - 'eval('
+    - 'exec('
+    - 'passthru('
+    - 'shell_exec('
+  condition: selection_path and keywords_in_file
+level: critical
+falsepositives:
+  - Very unlikely — PHP code should never appear in session files
+tags:
+  - attack.persistence
+  - attack.t1505
+  - cve.2026.109618
+
+---
+title: php2shell PHP OOM Fatal Error in Logs
+id: a1f2e3d4-5678-9abc-def0-php2shell005
+status: experimental
+description: >
+  Detects PHP out-of-memory fatal errors in application or error logs.
+  Repeated OOM errors on PHP endpoints receiving POST requests may indicate
+  CVE-2026-109618 OOM exploitation attempts.
+author: Qi Deng (@ikow)
+date: 2026-10-21
+references:
+  - https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
+logsource:
+  product: php
+  category: application
+detection:
+  keywords:
+    - 'Allowed memory size'
+    - 'exhausted'
+  filter_context:
+    - 'in Unknown on line 0'  # OOM during SAPI multipart parsing, not user code
+  condition: keywords
+level: medium
+falsepositives:
+  - Legitimate PHP scripts that consume too much memory
+tags:
+  - attack.initial_access
+  - cve.2026.109618
+---
+title: php2shell Chain F: Session Key Smuggling
+id: 5f2e6a8b-3c4d-4e5f-9a0b-1c2d3e4f5a6b
+status: experimental
+description: Detects POP gadget injection via pipe character in PHP_SESSION_UPLOAD_PROGRESS (Chain F — zero-LFI RCE)
+references:
+    - https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-109619
+author: php2shell-toolkit
+date: 2026/01/01
+tags:
+    - attack.execution
+    - attack.t1505.003
+    - cve.2026-109619
+logsource:
+    category: webserver
+    product: apache
+detection:
+    selection_post:
+        cs-method: 'POST'
+    selection_progress:
+        sc-request-body|contains: 'PHP_SESSION_UPLOAD_PROGRESS'
+    selection_pipe:
+        sc-request-body|re: 'PHP_SESSION_UPLOAD_PROGRESS.*\|.*O:'
+    condition: selection_post and selection_progress and selection_pipe
+falsepositives:
+    - Applications legitimately using upload progress tracking (rare)
+    - File upload services with progress indicators
+level: critical
+
+---
+title: php2shell Chain G: OPcache Poisoning
+id: 6a3f7b9c-1d2e-3f4a-5b6c-7d8e9f0a1b2c
+status: experimental
+description: Detects OPcache poisoning attempts — write to PHP file, cache, restore pattern
+references:
+    - https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-109618
+author: php2shell-toolkit
+date: 2026/01/01
+tags:
+    - attack.persistence
+    - attack.t1505.003
+logsource:
+    category: webserver
+    product: apache
+detection:
+    selection_write:
+        sc-request-body|contains: 'file_put_contents'
+    selection_php:
+        sc-request-body|contains: '.php'
+    selection_marker:
+        sc-request-body|contains: '___START___'
+    condition: selection_write and selection_php and selection_marker
+falsepositives:
+    - Legitimate PHP file upload services
+    - CMS systems that write PHP cache files
+level: high
+
+---
+title: php2shell Chain H: ZMM Arena Grooming
+id: 7b4f8c0d-2e3f-4a5b-6c7d-8e9f0a1b2c3d
+status: experimental
+description: Detects ZMM heap grooming — many small multipart form fields with sequential names
+references:
+    - https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-109618
+author: php2shell-toolkit
+date: 2026/01/01
+tags:
+    - attack.execution
+    - attack.t1203
+logsource:
+    category: webserver
+    product: apache
+detection:
+    selection_groom:
+        sc-request-body|re: 'name="g\d".*name="g\d".*name="g\d"'
+    selection_trigger:
+        sc-request-body|contains: 'ZMM_TRIGGER_OK'
+    condition: 1 of selection_*
+falsepositives:
+    - Applications with many sequential form fields (batch processing)
+level: medium
+
+---
+title: php2shell PHAR Bomb Attack
+id: 8c5f9d1e-3f4a-5b6c-7d8e-9f0a1b2c3d4e
+status: experimental
+description: Detects PHAR stream wrapper usage in LFI parameters (phar:// tmp file race)
+author: php2shell-toolkit
+date: 2026/01/01
+tags:
+    - attack.execution
+    - attack.t1505.003
+logsource:
+    category: webserver
+    product: apache
+detection:
+    selection_phar:
+        cs-uri-query|contains: 'phar://'
+    condition: selection_phar
+falsepositives:
+    - Legitimate PHAR-based applications (Composer, PHPUnit)
+level: high
+
+---
+title: php2shell LFI to RCE via php://filter chains
+id: 9d6f0e2f-4a5b-6c7d-8e9f-0a1b2c3d4e5f
+status: experimental
+description: Detects php://filter iconv chain attempts (Synacktiv technique)
+author: php2shell-toolkit
+date: 2026/01/01
+tags:
+    - attack.execution
+    - attack.t1505.003
+logsource:
+    category: webserver
+    product: apache
+detection:
+    selection_filter:
+        cs-uri-query|re: 'php://filter/convert\.iconv\.'
+    condition: selection_filter
+falsepositives:
+    - Legitimate use of PHP stream filters (rare in web requests)
+level: critical
+
+---
+title: php2shell Session Fixation Probe
+id: 0e7f1f3a-5b6c-7d8e-9f0a-1b2c3d4e5f6a
+status: experimental
+description: Detects session fixation probing — custom PHPSESSID injection
+author: php2shell-toolkit
+date: 2026/01/01
+tags:
+    - attack.t1539
+logsource:
+    category: webserver
+    product: apache
+detection:
+    selection_fixtest:
+        cs-cookie|startswith: 'PHPSESSID=fixtest'
+    condition: selection_fixtest
+falsepositives:
+    - None expected
+level: medium
+
+---
+title: php2shell GHOST DOOR — Persistence Primitives
+id: a1f2e3d4-5678-9abc-def0-php2shell006
+status: experimental
+description: >
+  Detects GHOST DOOR persistence artifacts planted by the php2shell
+  post-exploit module: template-cache poisoned files (.tpl_*.php),
+  .user.ini auto_prepend drops, session-dir resurrection files,
+  GIF89a+PHP polyglots, and composer autoload injection.
+author: Qi Deng (@ikow)
+date: 2026-10-24
+logsource:
+  category: webserver
+detection:
+  selection_uri:
+    http_uri|contains:
+      - '/.tpl_'
+      - '/.ghost_inc.php'
+      - '/.user.ini'
+      - 'autoload_files.php'
+  selection_param:
+    http_uri|contains:
+      - '?g='
+  condition: selection_uri or selection_param
+falsepositives:
+  - Legitimate template engines may generate .tpl files (check extension .php)
+  - Composer autoload_files.php modifications during deployments
+level: high
+tags:
+  - attack.persistence
+  - attack.t1505_003
+  - cve.2026-109618
