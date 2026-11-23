@@ -1,0 +1,3 @@
+# php2shell Unified Exploit Toolkit
+# No external dependencies - uses only Python standard library
+# Python 3.7+
